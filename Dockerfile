@@ -4,4 +4,4 @@ COPY . .
 
 RUN cargo install --path .
 
-CMD ["notion-ics"]
+ENTRYPOINT ["notion-ics"]

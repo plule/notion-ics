@@ -228,5 +228,7 @@ async fn sync(settings: &Settings, dry_run: bool) -> Result<()> {
         }
     }
 
+    info!("Synchronization successful");
+
     Ok(())
 }
