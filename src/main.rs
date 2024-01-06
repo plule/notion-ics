@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use icalendar::*;
 use notion::{
-    chrono::Duration,
     models::{
         properties::PropertyValue,
         search::{DatabaseQuery, FilterCondition, NotionSearch, PropertyCondition, TextCondition},
@@ -16,6 +15,7 @@ use notion::{
     *,
 };
 use serde::Deserialize;
+use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{debug, info};
 
 mod sync;
@@ -25,11 +25,13 @@ mod sync;
 struct Args {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[arg(long)]
+    schedule: Option<String>,
     #[arg(long, default_value = "settings.toml")]
     config: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Settings {
     pub ical_url: String,
     pub day_past: i64,
@@ -48,7 +50,31 @@ async fn main() -> Result<()> {
 
     info!("Reading configuration");
     let settings: Settings = toml::from_str(&std::fs::read_to_string(args.config)?)?;
+    sync(&settings, args.dry_run).await?;
 
+    if let Some(schedule) = &args.schedule {
+        info!("Scheduling sync");
+        let sched = JobScheduler::new().await?;
+        //let settings = settings.clone();
+        let job = Job::new_async(schedule.as_str(), {
+            move |_uuid, _lock| {
+                let settings = settings.clone();
+                Box::pin(async move {
+                    if let Err(err) = sync(&settings, false).await {
+                        tracing::error!("Failed to sync: {}", err);
+                    }
+                })
+            }
+        })?;
+        sched.add(job).await?;
+        sched.start().await?;
+        tokio::signal::ctrl_c().await?;
+    }
+
+    Ok(())
+}
+
+async fn sync(settings: &Settings, dry_run: bool) -> Result<()> {
     info!("Fetching calendar");
     let calendar = reqwest::get(&settings.ical_url)
         .await
@@ -136,8 +162,10 @@ async fn main() -> Result<()> {
         location_property: settings.location_property.as_deref(),
     };
 
-    let earliest = (chrono::offset::Local::now() - Duration::days(settings.day_past)).date_naive();
-    let latest = (chrono::offset::Local::now() + Duration::days(settings.day_future)).date_naive();
+    let earliest =
+        (chrono::offset::Local::now() - chrono::Duration::days(settings.day_past)).date_naive();
+    let latest =
+        (chrono::offset::Local::now() + chrono::Duration::days(settings.day_future)).date_naive();
 
     let mut creation_requests = Vec::new();
     let mut update_requests = Vec::new();
@@ -188,14 +216,14 @@ async fn main() -> Result<()> {
 
     for (title, request) in creation_requests {
         info!("Creating event {}", title);
-        if !args.dry_run {
+        if !dry_run {
             client.create_page(request).await?;
         }
     }
 
     for (title, page, request) in update_requests {
         info!("Updating event {}", title);
-        if !args.dry_run {
+        if !dry_run {
             client.update_page(page, request).await?;
         }
     }
