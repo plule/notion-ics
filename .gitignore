@@ -1,1 +1,3 @@
 /target
+*.ics
+settings.toml
