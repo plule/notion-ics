@@ -6,12 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.79"
 clap = { version = "4.4.13", features = ["derive"] }
-config = "0.13.4"
 icalendar = { version = "0.16.0", features = ["chrono-tz"] }
 notion = { git = "https://github.com/plule/notion.git", branch = "contrib" }
 reqwest = "0.11.23"
 serde = { version = "1.0.195", features = ["derive"] }
 tokio = "1.35.1"
+toml = "0.8.8"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"

@@ -1,7 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use config::Config;
 use icalendar::*;
 use notion::{
     chrono::Duration,
@@ -22,6 +25,8 @@ mod sync;
 struct Args {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[arg(long, default_value = "settings.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,26 +42,20 @@ struct Settings {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     info!("Reading configuration");
-    let settings = Config::builder()
-        .add_source(config::File::with_name("settings"))
-        .add_source(config::Environment::with_prefix("NOTION_ICS"))
-        .build()
-        .unwrap()
-        .try_deserialize::<Settings>()
-        .unwrap();
+    let settings: Settings = toml::from_str(&std::fs::read_to_string(args.config)?)?;
 
     info!("Fetching calendar");
     let calendar = reqwest::get(&settings.ical_url)
         .await
-        .expect("Failed to fetch calendar")
+        .context("Failed to fetch calendar")?
         .text()
         .await
-        .expect("Failed to read calendar")
+        .context("Failed to read calendar")?
         .parse::<Calendar>()
         .expect("Failed to parse calendar");
 
@@ -68,12 +67,23 @@ async fn main() {
         .collect();
 
     info!("Fetching Notion database");
-    let client = NotionApi::new(settings.notion_token.clone()).unwrap();
+    let client = NotionApi::new(settings.notion_token.clone())?;
     let query = NotionSearch::Query(settings.notion_calendar.clone());
-    let databases = client.search(query).await.unwrap();
-    let database = match databases.results.first().unwrap() {
-        models::Object::Database { database } => database,
-        _ => panic!("Not a database"),
+    let databases = client.search(query).await?;
+    let database = match databases
+        .results
+        .into_iter()
+        .filter_map(|obj| match obj {
+            models::Object::Database { database } => Some(database),
+            _ => None,
+        })
+        .next()
+    {
+        Some(db) => db,
+        _ => bail!(
+            "{} not found, check its name and if integrated with notion-ics",
+            settings.notion_calendar
+        ),
     };
 
     let title_property = database
@@ -87,7 +97,7 @@ async fn main() {
             }
         })
         .next()
-        .unwrap()
+        .context("No title property in the database?")?
         .clone();
 
     let query = DatabaseQuery {
@@ -97,14 +107,14 @@ async fn main() {
         }),
         ..Default::default()
     };
-    let notion_events = client.query_database(&database.id, query).await.unwrap();
+    let notion_events = client.query_database(&database.id, query).await?;
 
     let notion_events: HashMap<String, Page> = notion_events
         .results
         .into_iter()
         .map(|ev| {
-            let id_property = match ev.properties.properties.get(&settings.id_property).unwrap() {
-                PropertyValue::Text { rich_text, .. } => {
+            let id_property = match ev.properties.properties.get(&settings.id_property) {
+                Some(PropertyValue::Text { rich_text, .. }) => {
                     rich_text.first().unwrap().plain_text().to_string()
                 }
                 _ => panic!("Not a rich text"),
@@ -119,7 +129,7 @@ async fn main() {
 
     let sync = sync::Sync {
         notion: &client,
-        database,
+        database: &database,
         title_property: &title_property,
         id_property: &settings.id_property,
         date_property: &settings.date_property,
@@ -146,7 +156,10 @@ async fn main() {
             (Some(ical_event), None) => {
                 if let Some(date) = ical_event.get_start() {
                     let start = match date {
-                        DatePerhapsTime::DateTime(dt) => dt.try_into_utc().unwrap().date_naive(),
+                        DatePerhapsTime::DateTime(dt) => dt
+                            .try_into_utc()
+                            .context("Calendar without time zone")?
+                            .date_naive(),
                         DatePerhapsTime::Date(dt) => dt,
                     };
                     if start < earliest || start > latest {
@@ -176,14 +189,16 @@ async fn main() {
     for (title, request) in creation_requests {
         info!("Creating event {}", title);
         if !args.dry_run {
-            client.create_page(request).await.unwrap();
+            client.create_page(request).await?;
         }
     }
 
     for (title, page, request) in update_requests {
         info!("Updating event {}", title);
         if !args.dry_run {
-            client.update_page(page, request).await.unwrap();
+            client.update_page(page, request).await?;
         }
     }
+
+    Ok(())
 }

@@ -168,6 +168,7 @@ fn title_write_property(text: &str) -> WritePropertyValue {
     }
 }
 
+/// Build a rich text
 fn rich_text(text: &str) -> Vec<RichText> {
     vec![RichText::Text {
         rich_text: RichTextCommon {
@@ -182,6 +183,7 @@ fn rich_text(text: &str) -> Vec<RichText> {
     }]
 }
 
+/// Convert from an ical date range to a notion date value
 fn date_range(start: DatePerhapsTime, end: DatePerhapsTime) -> DateValue {
     match (start, end) {
         (DatePerhapsTime::Date(start), DatePerhapsTime::Date(end)) => {
