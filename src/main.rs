@@ -1,27 +1,34 @@
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::collections::{HashMap, HashSet};
 
+use clap::Parser;
 use config::Config;
 use icalendar::*;
 use notion::{
-    ids::PropertyId,
+    chrono::Duration,
     models::{
-        page::UpdatePageQuery,
-        properties::{self, DateOrDateTime, DateValue, PropertyValue, WritePropertyValue},
+        properties::PropertyValue,
         search::{DatabaseQuery, FilterCondition, NotionSearch, PropertyCondition, TextCondition},
-        text::{RichText, RichTextCommon, Text},
-        Database, Page, PageCreateRequest, Parent, Properties, WriteProperties,
+        Page,
     },
     *,
 };
 use serde::Deserialize;
 use tracing::{debug, info};
 
+mod sync;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct Settings {
     pub ical_url: String,
+    pub day_past: i64,
+    pub day_future: i64,
     pub notion_token: String,
     pub notion_calendar: String,
     pub id_property: String,
@@ -29,112 +36,10 @@ struct Settings {
     pub location_property: Option<String>,
 }
 
-struct Sync<'a> {
-    pub notion: &'a NotionApi,
-    pub database: &'a Database,
-    pub title_property: &'a str,
-    pub id_property: &'a str,
-    pub date_property: &'a str,
-    pub location_property: Option<&'a str>,
-}
-
-impl Sync<'_> {
-    /// Build the list of properties to write given an ical event
-    fn write_properties(&self, event: &Event) -> WriteProperties {
-        let mut properties: HashMap<String, WritePropertyValue> = HashMap::new();
-
-        let new_title = event.get_summary().unwrap_or_default();
-        if !new_title.is_empty() {
-            properties.insert(
-                self.title_property.to_string(),
-                title_write_property(new_title),
-            );
-        }
-
-        properties.insert(
-            self.id_property.to_string(),
-            text_write_property(event.get_uid().unwrap_or_default()),
-        );
-
-        properties.insert(
-            self.date_property.to_string(),
-            date_write_property(
-                event.get_start().unwrap().clone(),
-                event.get_end().unwrap().clone(),
-            ),
-        );
-
-        match (event.get_location(), self.location_property.clone()) {
-            (Some(location), Some(property)) => {
-                properties.insert(property.to_string(), text_write_property(location));
-            }
-            _ => {}
-        }
-
-        WriteProperties { properties }
-    }
-
-    /// Create a page based on an event
-    async fn create(&mut self, event: &Event) {
-        info!("Creating {}", event.get_summary().unwrap_or_default());
-        let properties = page_properties(self.write_properties(event));
-
-        let request = PageCreateRequest {
-            parent: Parent::Database {
-                database_id: self.database.id.clone(),
-            },
-            properties,
-        };
-        self.notion.create_page(request).await.unwrap();
-    }
-
-    /// Update a page based on an event
-    async fn update(&mut self, ical_event: &Event, notion_event: &Page) {
-        debug!("Updating");
-        let properties = self.write_properties(ical_event);
-
-        // Filter out properties that are already up to date
-        let properties: HashMap<String, WritePropertyValue> = properties
-            .properties
-            .into_iter()
-            .filter(|(name, value)| {
-                let property = notion_event.properties.properties.get(name);
-                if let Some(property) = property {
-                    let equal = property_comp(property, value);
-                    if !equal {
-                        info!("{}: {:?} != {:?}", name, property, value);
-                    }
-                    !equal
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        if properties.is_empty() {
-            info!(
-                "{} is up to date",
-                ical_event.get_summary().unwrap_or_default()
-            );
-            return;
-        }
-
-        info!("Updating {}", ical_event.get_summary().unwrap_or_default());
-        let query = UpdatePageQuery {
-            properties: Some(WriteProperties { properties }),
-            ..Default::default()
-        };
-
-        self.notion
-            .update_page(&notion_event.id, query)
-            .await
-            .unwrap();
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    let args = Args::parse();
 
     info!("Reading configuration");
     let settings = Config::builder()
@@ -156,7 +61,7 @@ async fn main() {
         .expect("Failed to parse calendar");
 
     let ical_events: HashMap<String, &Event> = calendar
-        .into_iter()
+        .iter()
         .rev()
         .filter_map(|ev| ev.as_event())
         .map(|ev| (ev.get_uid().unwrap_or_default().to_string(), ev))
@@ -212,7 +117,7 @@ async fn main() {
     let notion_ids = notion_events.keys().cloned().collect::<HashSet<_>>();
     let ids: Vec<String> = ical_ids.union(&notion_ids).cloned().collect();
 
-    let mut sync = Sync {
+    let sync = sync::Sync {
         notion: &client,
         database,
         title_property: &title_property,
@@ -221,13 +126,37 @@ async fn main() {
         location_property: settings.location_property.as_deref(),
     };
 
+    let earliest = (chrono::offset::Local::now() - Duration::days(settings.day_past)).date_naive();
+    let latest = (chrono::offset::Local::now() + Duration::days(settings.day_future)).date_naive();
+
+    let mut creation_requests = Vec::new();
+    let mut update_requests = Vec::new();
+
     for id in ids {
         match (ical_events.get(&id), notion_events.get(&id)) {
             (Some(ical_event), Some(notion_event)) => {
-                sync.update(ical_event, notion_event).await;
+                if let Some(query) = sync.update_request(ical_event, notion_event) {
+                    update_requests.push((
+                        ical_event.get_summary().unwrap_or_default(),
+                        &notion_event.id,
+                        query,
+                    ));
+                }
             }
             (Some(ical_event), None) => {
-                sync.create(ical_event).await;
+                if let Some(date) = ical_event.get_start() {
+                    let start = match date {
+                        DatePerhapsTime::DateTime(dt) => dt.try_into_utc().unwrap().date_naive(),
+                        DatePerhapsTime::Date(dt) => dt,
+                    };
+                    if start < earliest || start > latest {
+                        continue;
+                    }
+                }
+                creation_requests.push((
+                    ical_event.get_summary().unwrap_or_default(),
+                    sync.create_request(ical_event),
+                ));
             }
             (None, Some(_notion_event)) => {
                 debug!("Event {} is in Notion but not in ICS", id);
@@ -237,148 +166,24 @@ async fn main() {
             }
         }
     }
-}
 
-/// Convert a WritePropertyValue to a PropertyValue with empty ID (not necessary in most calls)
-fn page_property(write_property: WritePropertyValue) -> PropertyValue {
-    let id = PropertyId::from_str("").unwrap();
-    match write_property {
-        WritePropertyValue::Title { title } => PropertyValue::Title { id, title },
-        WritePropertyValue::Text { rich_text } => PropertyValue::Text { id, rich_text },
-        WritePropertyValue::Number { number } => PropertyValue::Number { id, number },
-        WritePropertyValue::Date { date } => PropertyValue::Date { id, date },
-        WritePropertyValue::Relation { relation } => PropertyValue::Relation { id, relation },
-        WritePropertyValue::People { people } => PropertyValue::People { id, people },
-        WritePropertyValue::Files { files } => PropertyValue::Files { id, files },
-        WritePropertyValue::Checkbox { checkbox } => PropertyValue::Checkbox { id, checkbox },
-        WritePropertyValue::Url { url } => PropertyValue::Url { id, url },
-        WritePropertyValue::Email { email } => PropertyValue::Email { id, email },
-        WritePropertyValue::PhoneNumber { phone_number } => {
-            PropertyValue::PhoneNumber { id, phone_number }
+    info!(
+        "Creating {} events and updating {} events",
+        creation_requests.len(),
+        update_requests.len()
+    );
+
+    for (title, request) in creation_requests {
+        info!("Creating event {}", title);
+        if !args.dry_run {
+            client.create_page(request).await.unwrap();
         }
-        _ => todo!(),
     }
-}
 
-fn page_properties(write_properties: WriteProperties) -> Properties {
-    let properties = write_properties
-        .properties
-        .into_iter()
-        .map(|(name, value)| (name, page_property(value)))
-        .collect();
-    Properties { properties }
-}
-
-fn rich_text_comp(a: &Vec<RichText>, b: &Vec<RichText>) -> bool {
-    a.iter()
-        .map(|t| t.plain_text())
-        .eq(b.iter().map(|t| t.plain_text()))
-}
-
-fn property_comp(property: &PropertyValue, write_property: &WritePropertyValue) -> bool {
-    match (property, write_property) {
-        (PropertyValue::Title { title, .. }, WritePropertyValue::Title { title: new_title }) => {
-            rich_text_comp(title, new_title)
+    for (title, page, request) in update_requests {
+        info!("Updating event {}", title);
+        if !args.dry_run {
+            client.update_page(page, request).await.unwrap();
         }
-        (
-            PropertyValue::Text { rich_text, .. },
-            WritePropertyValue::Text {
-                rich_text: new_rich_text,
-            },
-        ) => rich_text_comp(rich_text, new_rich_text),
-        (
-            PropertyValue::Number { number, .. },
-            WritePropertyValue::Number { number: new_number },
-        ) => number == new_number,
-        (PropertyValue::Date { date, .. }, WritePropertyValue::Date { date: new_date }) => {
-            date == new_date
-        }
-        (
-            PropertyValue::Relation { relation, .. },
-            WritePropertyValue::Relation {
-                relation: new_relation,
-            },
-        ) => relation == new_relation,
-        (
-            PropertyValue::People { people, .. },
-            WritePropertyValue::People { people: new_people },
-        ) => people == new_people,
-        (PropertyValue::Files { files, .. }, WritePropertyValue::Files { files: new_files }) => {
-            files == new_files
-        }
-        (
-            PropertyValue::Checkbox { checkbox, .. },
-            WritePropertyValue::Checkbox {
-                checkbox: new_checkbox,
-            },
-        ) => checkbox == new_checkbox,
-        (PropertyValue::Url { url, .. }, WritePropertyValue::Url { url: new_url }) => {
-            url == new_url
-        }
-        (PropertyValue::Email { email, .. }, WritePropertyValue::Email { email: new_email }) => {
-            email == new_email
-        }
-        (
-            PropertyValue::PhoneNumber { phone_number, .. },
-            WritePropertyValue::PhoneNumber {
-                phone_number: new_phone_number,
-            },
-        ) => phone_number == new_phone_number,
-        _ => todo!(),
-    }
-}
-
-fn text_write_property(text: &str) -> WritePropertyValue {
-    WritePropertyValue::Text {
-        rich_text: rich_text(text),
-    }
-}
-
-fn date_write_property(start: DatePerhapsTime, end: DatePerhapsTime) -> WritePropertyValue {
-    WritePropertyValue::Date {
-        date: Some(date_range(start, end)),
-    }
-}
-
-fn title_write_property(text: &str) -> WritePropertyValue {
-    WritePropertyValue::Title {
-        title: rich_text(text),
-    }
-}
-
-fn rich_text(text: &str) -> Vec<RichText> {
-    vec![RichText::Text {
-        rich_text: RichTextCommon {
-            plain_text: text.to_string(),
-            href: None,
-            annotations: None,
-        },
-        text: Text {
-            content: text.to_string(),
-            link: None,
-        },
-    }]
-}
-
-fn date_range(start: DatePerhapsTime, end: DatePerhapsTime) -> DateValue {
-    match (start, end) {
-        (DatePerhapsTime::Date(start), DatePerhapsTime::Date(end)) => {
-            let end = end.pred_opt().expect("Is this the big bang or what"); // ICS is exclusive, Notion is inclusive
-            DateValue {
-                start: DateOrDateTime::Date(start),
-                end: if start != end {
-                    Some(DateOrDateTime::Date(end))
-                } else {
-                    None
-                },
-                time_zone: None,
-            }
-        }
-        (DatePerhapsTime::DateTime(start), DatePerhapsTime::DateTime(end)) => DateValue {
-            start: DateOrDateTime::DateTime(start.try_into_utc().unwrap()),
-            end: Some(DateOrDateTime::DateTime(end.try_into_utc().unwrap())),
-            time_zone: None,
-        },
-        _ => panic!("Invalid date range"),
     }
 }
