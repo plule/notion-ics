@@ -1,3 +1,4 @@
+use core::str;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -25,14 +26,18 @@ mod sync;
 struct Args {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
-    #[arg(long)]
-    schedule: Option<String>,
     #[arg(long, default_value = "settings.toml")]
     config: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Settings {
+    #[serde(flatten)]
+    pub calendars: HashMap<String, CalSettings>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CalSettings {
     pub ical_url: String,
     pub day_past: i64,
     pub day_future: i64,
@@ -41,6 +46,7 @@ struct Settings {
     pub id_property: String,
     pub date_property: String,
     pub location_property: Option<String>,
+    pub schedule: Option<String>,
 }
 
 #[tokio::main]
@@ -50,31 +56,50 @@ async fn main() -> Result<()> {
 
     info!("Reading configuration");
     let settings: Settings = toml::from_str(&std::fs::read_to_string(args.config)?)?;
-    sync(&settings, args.dry_run).await?;
 
-    if let Some(schedule) = &args.schedule {
-        info!("Scheduling sync");
-        let sched = JobScheduler::new().await?;
-        //let settings = settings.clone();
-        let job = Job::new_async(schedule.as_str(), {
-            move |_uuid, _lock| {
+    info!("Initial synchronization");
+    for (name, settings) in &settings.calendars {
+        info!("Syncing {}", name);
+        sync(&settings, args.dry_run).await?;
+    }
+
+    if settings
+        .calendars
+        .iter()
+        .any(|(_, settings)| settings.schedule.is_some())
+    {
+        let mut sched = JobScheduler::new().await?;
+        for (name, settings) in &settings.calendars {
+            if let Some(schedule) = settings.schedule.clone() {
+                info!("Scheduling {} synchronization with \"{}\"", name, schedule);
+
                 let settings = settings.clone();
-                Box::pin(async move {
-                    if let Err(err) = sync(&settings, false).await {
-                        tracing::error!("Failed to sync: {}", err);
+                let job = Job::new_async(schedule.as_str(), {
+                    move |_uuid, _lock| {
+                        let settings = settings.clone();
+                        Box::pin(async move {
+                            if let Err(err) = sync(&settings, false).await {
+                                tracing::error!("Failed to sync: {}", err);
+                            }
+                        })
                     }
-                })
+                })?;
+                sched.add(job).await?;
             }
-        })?;
-        sched.add(job).await?;
+            if settings.schedule.is_none() {
+                info!("Syncing {}", name);
+                sync(&settings, args.dry_run).await?;
+            }
+        }
         sched.start().await?;
         tokio::signal::ctrl_c().await?;
+        sched.shutdown().await?;
     }
 
     Ok(())
 }
 
-async fn sync(settings: &Settings, dry_run: bool) -> Result<()> {
+async fn sync(settings: &CalSettings, dry_run: bool) -> Result<()> {
     info!("Fetching calendar");
     let calendar = reqwest::get(&settings.ical_url)
         .await

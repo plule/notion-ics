@@ -13,14 +13,15 @@ Many
 ## Settings
 
 ```toml
+[some name]
 ical_url = "https://example.com/calendar.ics"
 day_past = 60
 day_future = 60
 notion_token = "secret_token"
 notion_calendar = "Calendar database name"
 id_property = "String property name managed by notion-ics"
-date_property = "Date property"
-location_property = "Location property (optional)"
+date_property = "Date property name"
+location_property = "Location property name (optional)"
 ```
 
 ## Cli
